@@ -3326,8 +3326,13 @@ def cmd_test(args) -> int:
             if not _writable:
                 print(f"[SKIP] docker write e2e — bind mount not writable from container ({_why})")
             else:
+                # --cap-drop ALL strips DAC_OVERRIDE, so container root can't
+                # write a 0700 host dir: run as the project owner's uid:gid
+                # (the supported path; also keeps created files owned right).
+                _owner = f"{os.getuid()}:{os.getgid()}"
                 p = _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
                              "--backend", "docker", "--image", "ubuntu:24.04",
+                             "--container-user", _owner,
                              "--", "sh", "-c", "echo inside > marker.txt && cat marker.txt")
                 try:
                     marked = (proj / "marker.txt").read_text().strip()
