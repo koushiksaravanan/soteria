@@ -3310,13 +3310,39 @@ def cmd_test(args) -> int:
         if not docker_ok:
             print("[SKIP] docker e2e — daemon/image unavailable")
         else:
-            p = _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
-                         "--backend", "docker", "--image", "ubuntu:24.04",
-                         "--", "sh", "-c", "echo inside > marker.txt && cat marker.txt")
+            # Some hosts remap container root (userns), so the 0700 temp
+            # proj isn't writable from inside. Detect, open perms once,
+            # retry once — accommodation, not enforcement logic.
+            def _docker_write_once():
+                return _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
+                             "--backend", "docker", "--image", "ubuntu:24.04",
+                             "--", "sh", "-c", "echo inside > marker.txt && cat marker.txt")
+            p = _docker_write_once()
             try:
                 marked = (proj / "marker.txt").read_text().strip()
             except OSError:
                 marked = ""
+            if not (p.returncode == 0 and marked == "inside"):
+                try:
+                    _userns = subprocess.run(["docker", "info", "--format", "{{.SecurityOptions}}"],
+                                             capture_output=True, text=True, timeout=15)
+                    _remap = "userns" in (_userns.stdout or "")
+                except Exception:
+                    _remap = False
+                if _remap:
+                    try:
+                        os.chmod(proj, 0o777)
+                    except OSError:
+                        pass
+                    try:
+                        (proj / "marker.txt").unlink()
+                    except OSError:
+                        pass
+                    p = _docker_write_once()
+                    try:
+                        marked = (proj / "marker.txt").read_text().strip()
+                    except OSError:
+                        marked = ""
             check("docker exec writes to project",
                   p.returncode == 0 and "inside" in p.stdout and marked == "inside",
                   f"rc={p.returncode} err={p.stderr.strip()[:200]!r}")
@@ -3813,14 +3839,28 @@ def cmd_test(args) -> int:
         _t0 = _t18.monotonic()
         r18 = daemon_handle_request({"tool": "echo", "argv": ["hi"], "cwd": str(proj), "caller": "session", "depth": 0}, dctx_lim, {})
         _dt = _t18.monotonic() - _t0
-        # macOS skips RLIMIT_AS (breaks dyld) -> echo must still succeed;
-        # Linux: 8M may fail exec -> rc != 0. Either way: fast, no hang.
-        if sys.platform == "darwin":
-            check("tiny mem cap does not break darwin echo", r18.get("exit") == 0 and _dt < 10,
-                  f"exit={r18.get('exit')} dt={_dt:.1f}s")
+        # 8M AS fits /bin/echo on Linux (no dyld bloat) and is skipped on
+        # macOS -> tiny tools must still succeed everywhere, fast, no hang.
+        check("tiny mem cap does not break tiny tools", r18.get("exit") == 0 and _dt < 10,
+              f"exit={r18.get('exit')} dt={_dt:.1f}s")
+        # Real enforcement proof: a 64M alloc under an 8M cap must die on
+        # Linux (mmap fails); macOS skips AS so it succeeds (best-effort).
+        py18b = shutil.which("python3")
+        if py18b is None:
+            print("[SKIP] mem-cap enforcement probe — no python3 on PATH")
         else:
-            check("tiny mem cap fails fast", r18.get("exit") != 0 and _dt < 10,
-                  f"exit={r18.get('exit')} dt={_dt:.1f}s")
+            _t0 = _t18.monotonic()
+            r18b = daemon_handle_request(
+                {"tool": os.path.basename(py18b), "argv": ["-c", "bytearray(64*1024*1024)"],
+                 "cwd": str(proj), "caller": "session", "depth": 0},
+                dict(dctx_lim, base_path=os.path.dirname(py18b) + ":/bin:/usr/bin"), {})
+            _dt = _t18.monotonic() - _t0
+            if sys.platform == "darwin":
+                check("darwin mem cap best-effort documented", r18b.get("exit") == 0,
+                      f"exit={r18b.get('exit')}")
+            else:
+                check("linux mem cap kills big alloc", r18b.get("exit") != 0 and _dt < 10,
+                      f"exit={r18b.get('exit')} dt={_dt:.1f}s")
         check("cgroup unavailable skips gracefully",
               _cgroup_join_child("soteria-test-nonexistent", None, None) is False)
         p = _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
