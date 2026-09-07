@@ -19,10 +19,12 @@ git clone https://github.com/koushiksaravanan/soteria.git && cd soteria
 
 What that wires in: `~/.config/soteria/profiles/` (presets, auto-refreshed on later runs), `~/.soteria/` (audit log, snapshots, sessions), plus the optional app bundle and container image. No daemons, no services, no root.
 
-After the v0 tag, no clone needed:
+No clone needed:
 
 ```bash
-brew install https://raw.githubusercontent.com/koushiksaravanan/soteria/v0/Formula/soteria.rb
+brew tap koushiksaravanan/soteria
+brew trust koushiksaravanan/soteria   # one-time gate for third-party taps
+brew install soteria
 ```
 
 ## Everyday use — the menu-bar app (macOS)

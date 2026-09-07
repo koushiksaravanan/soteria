@@ -3968,14 +3968,18 @@ def cmd_test(args) -> int:
             (_cfg19 / "profiles" / "my-custom.json").write_text('{"custom": true}')
             p = _run_cli(home, "setup", env_extra={"SOTERIA_CONFIG": str(_cfg19)})
             _ref = json.loads((_cfg19 / "profiles" / "developer.json").read_text())
-            _baks = list((_cfg19 / "profiles").glob("developer.bak-*.json"))
+            _baks = list((_cfg19 / "profiles").glob("developer.bak-*"))
             check("setup refreshes stale preset",
                   p.returncode == 0 and _ref.get("stale") is None
-                  and len(_baks) == 1
+                  and len(_baks) == 1 and not _baks[0].suffix == ".json"
                   and (_cfg19 / "profiles" / "my-custom.json").read_text() == '{"custom": true}',
                   (p.stdout + p.stderr).strip()[-200:])
         except Exception as e:
             check("setup refreshes stale preset", False, str(e)[:200])
+        p = _run_cli(home, "profile", "list")
+        check("profile list hides backups",
+              p.returncode == 0 and ".bak-" not in p.stdout,
+              p.stdout.strip()[-200:])
 
     audit({"kind": "self_test", "level": "INFO",
            "summary": f"{sum(1 for _, ok, _ in results if ok)}/{len(results)} passed"})
@@ -3992,6 +3996,8 @@ def cmd_profile(args) -> int:
         for label, d in (("user", user_dir), ("bundled", _resource_dir("profiles"))):
             if d.exists():
                 for p in sorted(d.glob("*.json")):
+                    if ".bak-" in p.stem:
+                        continue  # setup refresh backups are not profiles
                     print(f"{label}: {p.stem} ({p})")
         return 0
     if action == "init":
@@ -4105,7 +4111,7 @@ def cmd_setup(args) -> int:
                     except OSError:
                         continue
                     if old != new:
-                        bak = cfg / "profiles" / f"{src.stem}.bak-{time.strftime('%Y%m%d-%H%M%S')}.json"
+                        bak = cfg / "profiles" / f"{src.stem}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
                         try:
                             shutil.copy2(dest, bak)
                             dest.write_bytes(new)
