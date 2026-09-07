@@ -18,7 +18,7 @@
 
 * External red-team of `write_sb_profile` + `_ProxyHandler` (the two functions self-tests can't validate).
 * Rebuild + Developer-ID-sign the frozen exe; re-verify it runs the suite.
-* Fill the `Formula/soteria.rb` sha256 from the v0 tarball so `brew install` works.
+* Fill the tap formula sha256 per release (`homebrew-soteria` repo) so `brew upgrade` tracks new tags.
 * `codex` end-to-end pass on macOS; Linux soft-box pass with `--backend docker`.
 * Per-tool network narrowing (scoped proxy tokens per tool).
 
