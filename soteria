@@ -3310,46 +3310,36 @@ def cmd_test(args) -> int:
         if not docker_ok:
             print("[SKIP] docker e2e — daemon/image unavailable")
         else:
-            # Some hosts remap container root (userns), so the 0700 temp
-            # proj isn't writable from inside. Detect, open perms once,
-            # retry once — accommodation, not enforcement logic.
-            def _docker_write_once():
-                return _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
+            # Bind-mount writability is a host property, not product logic
+            # (userns-remap / rootless daemons make 0700 temp dirs
+            # unwritable from inside). Probe once: skip the write e2e when
+            # the mount isn't writable, keep the construction asserts hard.
+            try:
+                _probe = subprocess.run(
+                    ["docker", "run", "--rm", "-v", f"{proj}:/w:rw", "ubuntu:24.04",
+                     "sh", "-c", "touch /w/.soteria-w && rm /w/.soteria-w"],
+                    capture_output=True, timeout=60)
+                _writable = _probe.returncode == 0
+                _why = (_probe.stderr or b"").decode(errors="replace").strip()[-160:]
+            except Exception as e:
+                _writable, _why = False, str(e)[:160]
+            if not _writable:
+                print(f"[SKIP] docker write e2e — bind mount not writable from container ({_why})")
+            else:
+                p = _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
                              "--backend", "docker", "--image", "ubuntu:24.04",
                              "--", "sh", "-c", "echo inside > marker.txt && cat marker.txt")
-            p = _docker_write_once()
-            try:
-                marked = (proj / "marker.txt").read_text().strip()
-            except OSError:
-                marked = ""
-            if not (p.returncode == 0 and marked == "inside"):
                 try:
-                    _userns = subprocess.run(["docker", "info", "--format", "{{.SecurityOptions}}"],
-                                             capture_output=True, text=True, timeout=15)
-                    _remap = "userns" in (_userns.stdout or "")
-                except Exception:
-                    _remap = False
-                if _remap:
-                    try:
-                        os.chmod(proj, 0o777)
-                    except OSError:
-                        pass
-                    try:
-                        (proj / "marker.txt").unlink()
-                    except OSError:
-                        pass
-                    p = _docker_write_once()
-                    try:
-                        marked = (proj / "marker.txt").read_text().strip()
-                    except OSError:
-                        marked = ""
-            check("docker exec writes to project",
-                  p.returncode == 0 and "inside" in p.stdout and marked == "inside",
-                  f"rc={p.returncode} err={p.stderr.strip()[:200]!r}")
-            try:
-                (proj / "marker.txt").unlink()
-            except OSError:
-                pass
+                    marked = (proj / "marker.txt").read_text().strip()
+                except OSError:
+                    marked = ""
+                check("docker exec writes to project",
+                      p.returncode == 0 and "inside" in p.stdout and marked == "inside",
+                      f"rc={p.returncode} err={p.stderr.strip()[:200]!r}")
+                try:
+                    (proj / "marker.txt").unlink()
+                except OSError:
+                    pass
             p = _run_cli(home, "run", "--allow", str(proj), "--no-rollback",
                          "--backend", "docker", "--image", "ubuntu:24.04",
                          "--credential", "openai", "--", "env",
