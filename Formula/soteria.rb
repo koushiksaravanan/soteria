@@ -1,11 +1,10 @@
-# Homebrew formula for soteria. Activates on the v0 push+tag:
+# Homebrew formula for soteria.
 #   brew install https://raw.githubusercontent.com/koushiksaravanan/soteria/v0/Formula/soteria.rb
-# (Or via a tap. Until then this file is untested — formulas need a real tarball.)
 class Soteria < Formula
   desc "Supervisor layer for coding agents"
   homepage "https://github.com/koushiksaravanan/soteria"
   url "https://github.com/koushiksaravanan/soteria/archive/refs/tags/v0.tar.gz"
-  sha256 "REPLACE_WITH_V0_TARBALL_SHA256"
+  sha256 "7aad5d998dfb35a8126d09deb3cca0996eacebb6613fa9391f7c476a4c6e12ff"
   license "MIT"
   depends_on "python@3.12"
 
