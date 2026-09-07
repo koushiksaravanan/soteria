@@ -1,0 +1,18 @@
+# build outputs (reproduce via README; ship binaries via GitHub Releases)
+build/
+dist/
+SoteriaBar.app/
+
+# generated at runtime
+*.sb
+.soteria-profile.json
+
+# python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# large art sources (generated icons are committed, sources stay local)
+app/SoteriaBar/MenuIcon-src.png

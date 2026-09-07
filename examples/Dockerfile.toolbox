@@ -1,0 +1,14 @@
+# Default toolbox image for `soteria run --backend docker`.
+# Build:  docker build -f examples/Dockerfile.toolbox -t soteria-toolbox .
+# Run:    ./soteria run --backend docker --image soteria-toolbox --allow ./proj -- bash
+#
+# Bare ubuntu lacks curl/python/git, which makes network verification and
+# everyday agent work fail confusingly. Bake the basics here; keep secrets
+# OUT (pass via --credential proxy or --env at run time, never ENV).
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 nodejs npm \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g --no-audit --no-fund @anthropic-ai/claude-code @openai/codex
+WORKDIR /workspace
+ENTRYPOINT []

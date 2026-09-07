@@ -1,0 +1,13 @@
+# Example harness image for `soteria run --backend docker`.
+# Build:  docker build -f examples/Dockerfile.claude -t soteria-claude .
+# Run:    ./soteria run --backend docker --image soteria-claude --allow ./proj -- claude
+#
+# Bake the harness + toolchains you need; keep secrets OUT (pass via
+# --credential proxy or --env at run time, never ENV in the image).
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git nodejs npm \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g @anthropic-ai/claude-code
+WORKDIR /workspace
+ENTRYPOINT []

@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "description": "LLM-only, no extra fs",
+    "name": "minimal"
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "groups": {
+    "exclude": [],
+    "include": [
+      "deny_credentials",
+      "deny_harness_state"
+    ]
+  },
+  "filesystem": {
+    "allow": [],
+    "bypass_protection": [],
+    "deny": [],
+    "read": [],
+    "write": []
+  },
+  "network": {
+    "allow_domain": [],
+    "credentials": [],
+    "deny_domain": [],
+    "network_profile": "minimal"
+  },
+  "command_policies": {
+    "commands": {}
+  }
+}

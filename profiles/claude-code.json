@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "description": "Claude Code agent defaults",
+    "name": "claude-code"
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "groups": {
+    "exclude": [],
+    "include": [
+      "deny_credentials",
+      "deny_harness_state",
+      "node_runtime",
+      "python_runtime",
+      "rust_runtime",
+      "unlink_protection"
+    ]
+  },
+  "filesystem": {
+    "allow": [],
+    "allow_files": [],
+    "bypass_protection": [],
+    "deny": [],
+    "read": [],
+    "write": []
+  },
+  "network": {
+    "allow_domain": [],
+    "credentials": [],
+    "deny_domain": [],
+    "network_profile": "claude-code"
+  },
+  "command_policies": {
+    "commands": {}
+  }
+}

@@ -1,0 +1,9 @@
+{"audit_seq":101,"kind":"session_start","level":"INFO","service":"soteria","session_id":"20260228-143201-48291","summary":"run --profile claude-code --network-profile claude-code -- claude","ts":"2026-02-28T14:32:01Z"}
+{"audit_seq":102,"kind":"resolve","level":"INFO","service":"tool","session_id":"20260228-143201-48291","summary":"resolve gh digest sha256:9a3b…6082","tool":"gh","ts":"2026-02-28T14:32:04Z"}
+{"audit_seq":103,"kind":"argv.allow","level":"ALLOW","service":"tool","session_id":"20260228-143201-48291","summary":"gh issue view 1052 --repo nolabs-ai/nono","tool":"gh","ts":"2026-02-28T14:32:04Z"}
+{"audit_seq":104,"kind":"l7.allow","level":"ALLOW","service":"github","session_id":"20260228-143201-48291","summary":"POST /graphql -> 200 (phantom GH_TOKEN, real injected at proxy)","tool":"gh","ts":"2026-02-28T14:32:05Z"}
+{"audit_seq":105,"kind":"fs.read","level":"ALLOW","service":"fs","session_id":"20260228-143201-48291","summary":"read src/auth/middleware.ts (in scope)","tool":"claude","ts":"2026-02-28T14:32:09Z"}
+{"audit_seq":106,"kind":"fs.deny","level":"DENY","service":"fs","session_id":"20260228-143201-48291","summary":"DENY read ~/.ssh/id_rsa reason=outside_allow_list","tool":"claude","ts":"2026-02-28T14:32:11Z"}
+{"audit_seq":107,"kind":"net.deny","level":"DENY","service":"proxy","session_id":"20260228-143201-48291","summary":"DENY CONNECT 169.254.169.254:80 reason=denied_cidr","tool":"claude","ts":"2026-02-28T14:32:14Z"}
+{"audit_seq":108,"kind":"sequence.finding","level":"ASK","service":"govern","session_id":"20260228-143201-48291","summary":"ASK git push origin/main — irreversible, needs approval (hash 7f3a…)","tool":"git","ts":"2026-02-28T14:32:20Z"}
+{"audit_seq":109,"kind":"seal","level":"INFO","service":"soteria","session_id":"20260228-143201-48291","summary":"session sealed merkle_root=9a3b7c1d…6082 files_changed=12","ts":"2026-02-28T14:32:30Z"}

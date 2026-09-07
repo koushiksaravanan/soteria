@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>soteria — launch</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#0b0e14; color:#dbe2ef; margin:0; }
+  header { background:#11161f; border-bottom:1px solid #232b3a; padding:10px 14px; display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:14px; margin:0; } header a { font-size:12px; color:#7aa2f7; }
+  main { max-width:900px; margin:0 auto; padding:16px 14px 60px; }
+  h2 { font-size:12px; color:#8b96ab; text-transform:uppercase; letter-spacing:.08em; margin:22px 0 8px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+  .card { border:1px solid #2c3a52; border-radius:10px; padding:12px; cursor:pointer; background:#11161f; }
+  .card.sel { border-color:#7aa2f7; background:#162032; }
+  .card b { display:block; font-size:14px; } .card span { font-size:11px; color:#8b96ab; }
+  label { font-size:12px; display:block; margin:8px 0; }
+  input[type=text], select { background:#1a2230; color:#dbe2ef; border:1px solid #2c3a52; border-radius:6px; padding:8px; font:inherit; font-size:13px; width:100%; box-sizing:border-box; }
+  input[type=checkbox] { accent-color:#7aa2f7; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  pre { background:#11161f; border:1px solid #232b3a; border-radius:8px; padding:12px; font-size:12px; overflow:auto; white-space:pre-wrap; }
+  button { background:#1a2230; color:#dbe2ef; border:1px solid #2c3a52; border-radius:6px; padding:8px 12px; font:inherit; font-size:12px; cursor:pointer; }
+  button.primary { background:#7aa2f7; border-color:#7aa2f7; color:#0b0e14; font-weight:bold; }
+  .hint { font-size:11px; color:#8b96ab; }
+</style>
+</head>
+<body>
+<header><h1>soteria · launch</h1><a href="/">← live monitor</a></header>
+<main>
+  <h2>1 · harness</h2>
+  <div class="cards" id="harness">
+    <div class="card sel" data-v="claude"><b>Claude Code</b><span>anthropic · --dangerously-skip-permissions boxed</span></div>
+    <div class="card" data-v="codex"><b>Codex</b><span>openai · bypass-approvals boxed</span></div>
+    <div class="card" data-v="opencode"><b>OpenCode</b><span>sst/opencode · any provider</span></div>
+    <div class="card" data-v="pi"><b>Pi</b><span> \: pi coding agent</span></div>
+  </div>
+
+  <h2>2 · how wild can it go?</h2>
+  <div class="cards" id="mode">
+    <div class="card" data-v="lockdown"><b>Lockdown</b><span>offline or LLM-only · no creds · ask on everything new</span></div>
+    <div class="card sel" data-v="balanced"><b>Balanced</b><span>project write + LLM + github/npm · ask on push/deploy</span></div>
+    <div class="card" data-v="wild"><b>Wild</b><span>broad dev net · still boxed fs + phantom creds · ask only on irreversible</span></div>
+  </div>
+
+  <h2>3 · scope</h2>
+  <div class="row2">
+    <label>Project folder<input type="text" id="proj" value="./my-project" /></label>
+    <label>Extra domains (comma separated)<input type="text" id="domains" placeholder="my-internal-api.example.com" /></label>
+  </div>
+  <label><input type="checkbox" id="rollback" checked /> snapshot + one-command undo</label>
+  <label><input type="checkbox" id="nodocker" checked /> deny docker / kubectl / podman</label>
+
+  <h2>4 · credentials (phantom — real never enters box)</h2>
+  <label><input type="checkbox" class="cred" value="anthropic" checked /> anthropic (Claude)</label>
+  <label><input type="checkbox" class="cred" value="openai" /> openai (Codex)</label>
+  <label><input type="checkbox" class="cred" value="github" checked /> github (proxy + endpoint-limited)</label>
+
+  <h2>5 · run it</h2>
+  <pre id="cmd"></pre>
+  <div style="display:flex;gap:8px;margin:8px 0">
+    <button class="primary" id="copyCmd">copy command</button>
+    <button id="copyProfile">copy profile.json</button>
+  </div>
+  <div class="hint" id="explain"></div>
+  <h2>profile.json (version with your code)</h2>
+  <pre id="profile"></pre>
+</main>
+<script>
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+function sel(id){ const el = document.querySelector('#'+id+' .sel'); return el ? el.dataset.v : ''; }
+$$('#harness .card, #mode .card').forEach(c => c.onclick = ()=>{ c.parentNode.querySelectorAll('.card').forEach(x=>x.classList.remove('sel')); c.classList.add('sel'); render(); });
+['proj','domains','rollback','nodocker'].forEach(id => document.getElementById(id).oninput = document.getElementById(id).onchange = render);
+$$('.cred').forEach(c => c.onchange = render);
+
+const HARNESS_BIN = { claude:'claude --dangerously-skip-permissions', codex:'codex --dangerously-bypass-approvals-and-sandbox', opencode:'opencode', pi:'pi' };
+const MODE_NET = { lockdown:'minimal', balanced:'developer', wild:'developer' };
+
+function render(){
+  const h = sel('harness'), m = sel('mode');
+  const proj = $('#proj').value.trim() || './my-project';
+  const extra = $('#domains').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const creds = $$('.cred').filter(c=>c.checked).map(c=>c.value);
+  const net = m === 'lockdown' ? 'minimal' : MODE_NET[m];
+  const blockNet = (m === 'lockdown' && creds.length === 0 && !extra.length) ? false : false;
+
+  let cmd = `soteria run --profile ${h} --allow ${proj} --network-profile ${net}`;
+  extra.forEach(d => cmd += ` --allow-domain ${d}`);
+  creds.forEach(c => cmd += ` --credential ${c}`);
+  if ($('#rollback').checked) cmd += ' --rollback';
+  if ($('#nodocker').checked) cmd += ' --deny-commands docker,kubectl,podman';
+  if (m === 'lockdown') cmd += ' --ask-mode strict';
+  if (m === 'wild') cmd += ' --ask-mode irreversible-only';
+  cmd += ` -- ${HARNESS_BIN[h]}`;
+
+  const profile = {
+    meta: { name: `${h}-${m}`, version: '1.0.0' },
+    security: { groups: ['node_runtime','python_runtime'] },
+    filesystem: { allow: [proj], read_file: ['$HOME/.gitconfig'] },
+    network: { network_profile: net, allow_domain: extra, credentials: creds, block: false },
+    policy: $('#nodocker').checked ? { add_deny_commands: ['docker','docker-compose','podman','kubectl'] } : {},
+    undo: { enabled: $('#rollback').checked },
+    ask: m === 'lockdown' ? 'strict' : m === 'balanced' ? 'escalations' : 'irreversible-only'
+  };
+  $('#cmd').textContent = cmd;
+  $('#profile').textContent = JSON.stringify(profile, null, 2);
+  $('#explain').textContent =
+    m === 'lockdown' ? 'Boxed fs to project only, LLM APIs only, no broad net. Anything new asks.' :
+    m === 'balanced' ? 'Boxed fs, dev net (LLM + github/npm + your domains), phantom creds, push/deploy asks.' :
+    'Still boxed fs + filtered net + phantom creds. Broadest dev access, asks only on irreversible (push, deploy, delete).';
+}
+$('#copyCmd').onclick = ()=> navigator.clipboard.writeText($('#cmd').textContent);
+$('#copyProfile').onclick = ()=> navigator.clipboard.writeText($('#profile').textContent);
+render();
+</script>
+</body>
+</html>

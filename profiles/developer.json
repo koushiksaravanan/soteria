@@ -1,0 +1,35 @@
+{
+  "meta": {
+    "description": "general dev net + runtimes",
+    "name": "developer"
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "groups": {
+    "exclude": [],
+    "include": [
+      "deny_credentials",
+      "deny_harness_state",
+      "node_runtime",
+      "python_runtime",
+      "unlink_protection"
+    ]
+  },
+  "filesystem": {
+    "allow": [],
+    "bypass_protection": [],
+    "deny": [],
+    "read": [],
+    "write": []
+  },
+  "network": {
+    "allow_domain": [],
+    "credentials": [],
+    "deny_domain": [],
+    "network_profile": "developer"
+  },
+  "command_policies": {
+    "commands": {}
+  }
+}
