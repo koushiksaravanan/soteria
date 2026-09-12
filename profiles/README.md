@@ -9,4 +9,4 @@
 ./soteria profile diff --a minimal --b developer
 ```
 
-Custom profiles support `extends`, `groups`, `filesystem` (allow/read/write/deny), `network` (domains/credentials), and `command_policies.commands` (`from`/`can_use`/`invocation_policy`/`sandbox` fs scope). CLI flags override profile values.
+Custom profiles support `extends`, `groups`, `filesystem` (allow/read/write/deny), `network` (domains/credentials), and `command_policies.commands` (`from`/`can_use`/`invocation_policy`, `sandbox` fs scope, `network` egress scope with `allow_domains`/`deny_domains`/`allow_endpoints`/`services` — always a subset of the session). CLI flags override profile values.

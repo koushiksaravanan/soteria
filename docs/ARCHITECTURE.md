@@ -89,10 +89,19 @@ Legacy in-box `_broker` gate+exec remains as fail-closed fallback when the
 socket is unreachable. Seatbelt re-allows shim-dir reads so shims run under
 kernel mode. The launch gate resolves the approved top-level tool to its real
 binary so it isn't re-gated; `--allow-command` exempts a tool everywhere.
-Still pending: digest-verified exec, per-tool network narrowing, native
-Landlock — full child micro-sandbox stays delegated to `--backend nono`.
-Shell builtins and in-interpreter calls (`os.remove`) bypass shims by
-construction; kernel deny groups remain the backstop.
+Still pending: digest-verified exec, native Landlock — full child
+micro-sandbox stays delegated to `--backend nono`. Shell builtins and
+in-interpreter calls (`os.remove`) bypass shims by construction; kernel
+deny groups remain the backstop.
+
+Per-tool network narrowing rides the same spawn: `command_policies.commands.<tool>.network`
+(`allow_domains`/`deny_domains`/`allow_endpoints`/`services`, all optional)
+is intersected down to a subset of the session scope at spawn
+(allow-intersect, deny-union, endpoint-replace, service-overlap), minted as a
+per-tool proxy token (`broker.net_scope` audit, value never logged), and
+enforced on both paths — CONNECT allow/deny comes from the token scope,
+reverse routes additionally gate on token services and scope rules. Absent
+policy inherits the session scope; without a proxy there is nothing to narrow.
 
 Resource caps ride the same spawn path: `--memory` (parsed by `parse_size`,
 `K/M/G` + bare bytes, `0` = no cap), `--max-processes` (`RLIMIT_NPROC`),
