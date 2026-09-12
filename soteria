@@ -209,6 +209,22 @@ def validate_profile(p: dict) -> list[str]:
                             errs.append(f"command_policies.commands.{tool}.sandbox.{k} must be a list")
                     for k in set(sb) - {"fs_read", "fs_write"}:
                         errs.append(f"command_policies.commands.{tool}.sandbox.{k} unknown (want fs_read/fs_write)")
+            nb = pol.get("network")
+            if nb is not None:
+                if not isinstance(nb, dict):
+                    errs.append(f"command_policies.commands.{tool}.network must be an object")
+                else:
+                    for k in ("allow_domains", "deny_domains", "allow_endpoints", "services"):
+                        if k in nb and not isinstance(nb[k], list):
+                            errs.append(f"command_policies.commands.{tool}.network.{k} must be a list")
+                    for k in set(nb) - {"allow_domains", "deny_domains", "allow_endpoints", "services"}:
+                        errs.append(f"command_policies.commands.{tool}.network.{k} unknown (want allow_domains/deny_domains/allow_endpoints/services)")
+                    for spec in (nb.get("allow_endpoints") or []):
+                        parts = str(spec).split(":", 2)
+                        if not isinstance(spec, str) or len(parts) != 3 or not all(p.strip() for p in parts):
+                            errs.append(f"command_policies.commands.{tool}.network.allow_endpoints entry {spec!r} must be Service:METHOD:/glob")
+            for k in set(pol) - {"from", "can_use", "invocation_policy", "sandbox", "network"}:
+                errs.append(f"command_policies.commands.{tool}.{k} unknown (want from/can_use/invocation_policy/sandbox/network)")
     return errs
 
 
@@ -900,6 +916,51 @@ def tool_sandbox_for(tool: str, commands: dict) -> dict:
     return sb
 
 
+def tool_network_for(tool: str, commands: dict) -> dict:
+    """Per-tool network block: allow_domains/deny_domains/allow_endpoints/services.
+
+    All lists; missing/empty = inherit the session scope at spawn.
+    """
+    pol = (commands or {}).get(tool, {})
+    nb = pol.get("network") or {}
+    if not isinstance(nb, dict):
+        nb = {}
+    out = {}
+    for k in ("allow_domains", "deny_domains", "allow_endpoints", "services"):
+        v = nb.get(k) or []
+        out[k] = list(v) if isinstance(v, list) else []
+    return out
+
+
+def tool_network_scope(tool: str, session: dict, tool_net: dict) -> dict:
+    """Narrow the session scope for one tool. Always a subset (fail-closed).
+
+    session = {"allow", "deny", "rules": [(svc, METHOD, glob)], "services"}.
+    allow: intersected when the tool narrows, else inherited.
+    deny: union. rules: tool's list replaces the session's when specified.
+    services: narrowed to the overlap when specified.
+    """
+    sess_allow_l = {str(d).lower() for d in (session.get("allow") or [])}
+    t_allow = tool_net.get("allow_domains") or []
+    allow = [d for d in t_allow if str(d).lower() in sess_allow_l] if t_allow else list(session.get("allow") or [])
+    deny = list(dict.fromkeys([str(d) for d in (session.get("deny") or [])]
+                              + [str(d) for d in (tool_net.get("deny_domains") or [])]))
+    t_rules = tool_net.get("allow_endpoints") or []
+    rules = []
+    for spec in t_rules:
+        parts = str(spec).split(":", 2)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            continue  # validated at profile load; skip junk defensively
+        svc, method, glob = (p.strip() for p in parts)
+        rules.append((svc, method.upper(), glob))
+    if not rules:
+        rules = [(str(s), str(m), str(g)) for s, m, g in (session.get("rules") or [])]
+    t_svcs = {str(s).lower() for s in (tool_net.get("services") or [])}
+    services = ([s for s in (session.get("services") or []) if str(s).lower() in t_svcs]
+                if t_svcs else list(session.get("services") or []))
+    return {"allow": allow, "deny": deny, "rules": rules, "services": services}
+
+
 def _resolve_tool_dirs(entries: list[str], cwd: str) -> list[str]:
     out = []
     for e in entries or []:
@@ -1088,6 +1149,30 @@ def daemon_handle_request(req: dict, ctx: dict, sb_cache: dict | None = None) ->
                 "truncated": False}
     env = dict(ctx.get("base_env", {}))
     env["SOTERIA_BROKER_DEPTH"] = str(depth + 1)
+    # P19: per-tool network narrowing — mint a scoped proxy token so the
+    # tool's egress is a subset of the session's. Token value never logged.
+    proxy_ref = ctx.get("proxy_ref")
+    session_scope = ctx.get("net_scope")
+    if proxy_ref is not None and isinstance(session_scope, dict):
+        try:
+            services = list((getattr(proxy_ref.server, "soteria_routes", None) or {}).keys())
+            tnet = tool_network_for(tool, commands)
+            scope = tool_network_scope(tool, {**session_scope, "services": services}, tnet)
+            tok = proxy_mint_tool_token(proxy_ref.server, tool, scope)
+            env["SOTERIA_PROXY_TOKEN"] = tok
+            phost = ctx.get("proxy_host") or "127.0.0.1"
+            pport = getattr(proxy_ref, "port", 0) or 0
+            if pport:
+                purl = f"http://soteria:{tok}@{phost}:{pport}"
+                for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                    if k in env:
+                        env[k] = purl
+            audit({"kind": "broker.net_scope", "level": "INFO", "session_id": sid,
+                   "summary": f"{tool} scoped token: allow={len(scope['allow'])} deny={len(scope['deny'])} "
+                              f"rules={len(scope['rules'])} services={len(scope['services'])}", "tool": tool})
+        except Exception as e:
+            audit({"kind": "broker.net_scope_fail", "level": "INFO", "session_id": sid,
+                   "summary": f"{tool} scope mint failed ({type(e).__name__}), session token kept", "tool": tool})
     timeout = int(ctx.get("tool_timeout", DAEMON_TOOL_TIMEOUT_DEFAULT) or DAEMON_TOOL_TIMEOUT_DEFAULT)
     try:
         mem = ctx.get("memory_bytes")
@@ -1575,6 +1660,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _proxy_auth(self, route_token: str) -> tuple[bool, dict | None]:
+        """Resolve the presented token: (True, None) = session token (full
+        route rules); (True, scope) = per-tool narrowed scope; else deny."""
+        presented = self.headers.get("X-Soteria-Token", "") or ""
+        if presented and presented == route_token:
+            return True, None
+        toks = getattr(self.server, "soteria_tool_tokens", None) or {}
+        if presented and presented in toks:
+            return True, toks[presented]
+        return False, None
+
     def _proxy(self):
         routes = self.server.soteria_routes
         path_q = self.path.split("?", 1)
@@ -1583,16 +1679,21 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         rest = "/" + (segs[1] if len(segs) > 1 else "")
         if route is None:
             return self._deny(404, f"no proxy route for {path_q[0][:80]}")
-        if self.headers.get("X-Soteria-Token") != route["token"]:
+        ok, scope = self._proxy_auth(route["token"])
+        if not ok:
             return self._deny(407, "bad proxy token")
+        if scope is not None and scope.get("services") and segs[0] not in scope["services"]:
+            return self._deny(403, f"route {segs[0]} outside tool scope ({scope.get('tool')})")
         # P2: always-denied + deny_domain enforcement at L7 boundary
         up_host = urlsplit(route["upstream"]).hostname or ""
         if is_always_denied_host(up_host):
             return self._deny(403, f"upstream {up_host} always-denied (metadata/link-local)")
-        if up_host.lower() in {d.lower() for d in (route.get("deny_domains") or [])}:
+        deny_all = {d.lower() for d in (route.get("deny_domains") or [])} | {str(d).lower() for d in ((scope or {}).get("deny") or [])}
+        if up_host.lower() in deny_all:
             return self._deny(403, f"upstream {up_host} in deny_domain")
-        if route["rules"] and not any(m == self.command and fnmatch.fnmatch(rest, g)
-                                      for m, g in route["rules"]):
+        rules = scope["rules"] if (scope is not None and scope.get("rules")) else route["rules"]
+        if rules and not any(m == self.command and fnmatch.fnmatch(rest, g)
+                             for m, g in rules):
             return self._deny(403, f"{route['name']} {self.command} {rest} not in endpoint rules")
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(min(length, PROXY_BODY_LIMIT)) if length else None
@@ -1616,7 +1717,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             return self._deny(502, f"upstream error: {type(e).__name__}")
         try:
             audit({"kind": "proxy.allow", "level": "ALLOW", "session_id": self.server.soteria_sid,
-                   "summary": f"{route['name']} {self.command} {rest} -> {status}"})
+                   "summary": f"{route['name']} {self.command} {rest} -> {status}" + (f" [tool {scope['tool']}]" if scope is not None else "")})
         except OSError:
             pass  # audit must never break a proxied request
         self.send_response(status)
@@ -1627,20 +1728,28 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _connect_auth_ok(self, token: str) -> bool:
-        if self.headers.get("X-Soteria-Token") == token:
-            return True
+    def _connect_scope(self, session_token: str) -> tuple[bool, dict | None]:
+        """Like _proxy_auth but for CONNECT: session token, Bearer/Basic
+        password, or X-Soteria-Token header — session or per-tool scope."""
+        presented = [self.headers.get("X-Soteria-Token", "") or ""]
         auth = self.headers.get("Proxy-Authorization", "")
         if auth.startswith("Bearer "):
-            return auth[7:].strip() == token
-        if auth.startswith("Basic "):
+            presented.append(auth[7:].strip())
+        elif auth.startswith("Basic "):
             try:
                 creds = base64.b64decode(auth[6:]).decode("utf-8", "replace")
             except Exception:
-                return False
+                creds = ""
             userpass = creds.split(":", 1)
-            return len(userpass) == 2 and userpass[1] == token
-        return False
+            presented.append(userpass[1] if len(userpass) == 2 else "")
+        for p in presented:
+            if p and p == session_token:
+                return True, None
+        toks = getattr(self.server, "soteria_tool_tokens", None) or {}
+        for p in presented:
+            if p and p in toks:
+                return True, toks[p]
+        return False, None
 
     def _connect_deny(self, target: str, reason: str):
         try:
@@ -1668,7 +1777,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if not host or not port_s.isdigit():
             return self._connect_deny(target[:80], "malformed target, want host:port")
         port = int(port_s)
-        if not self._connect_auth_ok(cfg.get("token", "")):
+        ok, scope = self._connect_scope(cfg.get("token", ""))
+        if not ok:
             try:
                 audit({"kind": "proxy.deny", "level": "DENY",
                        "session_id": self.server.soteria_sid,
@@ -1687,9 +1797,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             return
         if is_always_denied_host(host):
             return self._connect_deny(target[:80], "denied_cidr (metadata/link-local)")
-        if any(_host_match(host, d) for d in (cfg.get("deny") or [])):
+        allow = scope["allow"] if scope is not None else cfg.get("allow")
+        deny = scope["deny"] if scope is not None else cfg.get("deny")
+        if any(_host_match(host, d) for d in (deny or [])):
             return self._connect_deny(target[:80], "deny_domain")
-        if cfg.get("enforce") and not any(_host_match(host, a) for a in (cfg.get("allow") or [])):
+        if cfg.get("enforce") and not any(_host_match(host, a) for a in (allow or [])):
             return self._connect_deny(target[:80], "not in allow-list")
         # DNS-rebinding check: resolve here, refuse metadata/link-local answers
         try:
@@ -1719,7 +1831,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             audit({"kind": "proxy.connect_allow", "level": "ALLOW",
                    "session_id": self.server.soteria_sid,
-                   "summary": f"CONNECT {target[:80]}"})
+                   "summary": f"CONNECT {target[:80]}" + (f" [tool {scope['tool']}]" if scope is not None else "")})
         except OSError:
             pass
         client = self.connection
@@ -1779,6 +1891,30 @@ class _Proxy:
         self.server.server_close()
 
 
+def connect_allow_for(network_profile: str | None, allow_domains: list[str] | None) -> list[str]:
+    """CONNECT allow-list: explicit domains + the profile's groups, de-duped."""
+    group_hosts: list[str] = []
+    for g in NETWORK_PROFILES.get((network_profile or "").lower(), []):
+        group_hosts += NETWORK_GROUPS.get(g, [])
+    return list(dict.fromkeys(list(allow_domains or []) + group_hosts))
+
+
+def proxy_mint_tool_token(server, tool: str, scope: dict) -> str:
+    """Mint a per-tool proxy token bound to a narrowed scope. Never log the value."""
+    import secrets as _secrets
+    tok = _secrets.token_hex(32)
+    toks = getattr(server, "soteria_tool_tokens", None)
+    if not isinstance(toks, dict):
+        toks = {}
+        server.soteria_tool_tokens = toks
+    toks[tok] = {"tool": str(tool),
+                 "allow": list(scope.get("allow") or []),
+                 "deny": list(scope.get("deny") or []),
+                 "rules": list(scope.get("rules") or []),
+                 "services": list(scope.get("services") or [])}
+    return tok
+
+
 def start_proxy(svcs: list[str], parent_env: dict, sid: str,
                 endpoint_rules: list[tuple[str, str, str]], base_host: str = "127.0.0.1",
                 deny_domains: list[str] | None = None,
@@ -1829,15 +1965,13 @@ def start_proxy(svcs: list[str], parent_env: dict, sid: str,
     # selected network_profile's groups (fail-closed like nono); deny and
     # always-denied apply on top. Credential-only runs thus still filter
     # generic egress to the profile's groups instead of leaving it open.
-    group_hosts: list[str] = []
-    for g in NETWORK_PROFILES.get((network_profile or "").lower(), []):
-        group_hosts += NETWORK_GROUPS.get(g, [])
     explicit_filter = bool(allow_domains) or bool(deny_domains)
-    connect_allow = list(dict.fromkeys(list(allow_domains or []) + group_hosts))
+    connect_allow = connect_allow_for(network_profile, allow_domains)
     if not routes and not explicit_filter:
         return None
     server = ThreadingHTTPServer(("127.0.0.1", proxy_port or 0), _ProxyHandler)
     server.soteria_routes = routes
+    server.soteria_tool_tokens = {}
     server.soteria_connect = {"token": token, "allow": connect_allow,
                               "deny": list(deny_domains or []),
                               "enforce": True}
@@ -2582,6 +2716,15 @@ def cmd_run(args) -> int:
                 "block_net": bool(args.block_net),
                 "deny_paths": deny_dirs0,
                 "seatbelt": True,
+                # P19: per-tool net narrowing — same scope the proxy enforces.
+                "proxy_ref": proxy,
+                "proxy_host": "host.docker.internal" if use_docker else "127.0.0.1",
+                "net_scope": {
+                    "allow": connect_allow_for(resolved_net, merged_allow),
+                    "deny": list(merged_deny),
+                    "rules": [(str(s), str(m), str(g)) for s, m, g in rules],
+                    "services": [],
+                } if proxy is not None else None,
             })
             daemon.start()
             audit({"kind": "sandbox.shims", "level": "INFO", "session_id": sid or "no-snap",
@@ -3995,6 +4138,132 @@ def cmd_test(args) -> int:
                      "--", "/bin/cat", str(Path.home() / ".kube" / "config"))
         check("kubeconfig read denied", p.returncode == 3,
               f"rc={p.returncode} out={(p.stdout + p.stderr).strip()[-200:]!r}")
+
+        # P19b: per-tool network narrowing — pure scope math
+        check("tool network defaults inherit",
+              tool_network_for("gh", {}) == {"allow_domains": [], "deny_domains": [], "allow_endpoints": [], "services": []})
+        check("tool network narrow passthrough",
+              tool_network_for("gh", {"gh": {"network": {"allow_domains": ["a.com"], "deny_domains": ["b.com"],
+                                                         "allow_endpoints": ["github:GET:/x"], "services": ["github"]}}})
+              == {"allow_domains": ["a.com"], "deny_domains": ["b.com"],
+                  "allow_endpoints": ["github:GET:/x"], "services": ["github"]})
+        _sess_scope = {"allow": ["a.com", "b.com"], "deny": ["evil.com"],
+                       "rules": [("github", "GET", "/repos/**")], "services": ["github", "openai"]}
+        _tn = {"allow_domains": ["a.com", "elsewhere.com"], "deny_domains": ["bad.com"],
+               "allow_endpoints": ["github:GET:/repos/x"], "services": ["github"]}
+        _sc = tool_network_scope("gh", _sess_scope, _tn)
+        check("tool scope narrows to subset",
+              _sc["allow"] == ["a.com"] and "evil.com" in _sc["deny"] and "bad.com" in _sc["deny"]
+              and _sc["rules"] == [("github", "GET", "/repos/x")] and _sc["services"] == ["github"])
+        check("tool scope inherits when empty",
+              tool_network_scope("gh", _sess_scope, tool_network_for("gh", {})) == _sess_scope)
+        check("connect allow helper merges groups",
+              "example.com" in connect_allow_for("developer", ["example.com"])
+              and any(_host_match("api.openai.com", h) for h in connect_allow_for("minimal", [])))
+        check("network validation rejects bad shape",
+              any("network.allow_endpoints" in e for e in validate_profile(
+                  {"command_policies": {"commands": {"t": {"network": {"allow_endpoints": ["bogus"]}}}}}))
+              and any("unknown" in e for e in validate_profile(
+                  {"command_policies": {"commands": {"t": {"network": {"bogus_key": []}}}}}))
+              and not validate_profile(
+                  {"command_policies": {"commands": {"t": {"network": {"allow_domains": ["a.com"]}}}}}))
+
+        # P19c: live per-tool CONNECT scope (hermetic localhost echo)
+        import socket as _sock19
+        echo19 = _sock19.socket(_sock19.AF_INET, _sock19.SOCK_STREAM)
+        echo19.setsockopt(_sock19.SOL_SOCKET, _sock19.SO_REUSEADDR, 1)
+        echo19.bind(("127.0.0.1", 0))
+        echo19.listen(5)
+        echo19_port = echo19.getsockname()[1]
+        stop19 = threading.Event()
+
+        def _echo19_loop():
+            echo19.settimeout(0.5)
+            while not stop19.is_set():
+                try:
+                    conn, _ = echo19.accept()
+                except OSError:
+                    continue
+                with conn:
+                    conn.settimeout(5)
+                    try:
+                        while True:
+                            data = conn.recv(65536)
+                            if not data:
+                                break
+                            conn.sendall(data)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=_echo19_loop, daemon=True).start()
+        try:
+            px19 = start_proxy([], dict(os.environ), "test-toolscope",
+                               [], allow_domains=["127.0.0.1", "example.com"],
+                               network_profile="minimal")
+            if px19 is None:
+                check("tool scope proxy starts", False, "proxy is None")
+            else:
+                sess_tok = px19.child_env["SOTERIA_PROXY_TOKEN"]
+                tscope = tool_network_scope("gh", {"allow": ["127.0.0.1"], "deny": [],
+                                                   "rules": [], "services": []},
+                                            {"allow_domains": ["127.0.0.1"], "deny_domains": [],
+                                             "allow_endpoints": [], "services": []})
+                ttok = proxy_mint_tool_token(px19.server, "gh", tscope)
+                check("tool token minted distinct", bool(ttok) and ttok != sess_tok and len(ttok) == 64)
+
+                def _creq19(target, tok):
+                    c = _sock19.create_connection(("127.0.0.1", px19.port), timeout=10)
+                    c.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Bearer {tok}\r\n\r\n".encode())
+                    resp = b""
+                    while b"\r\n\r\n" not in resp:
+                        chunk = c.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                    return c, resp
+
+                c, resp = _creq19(f"127.0.0.1:{echo19_port}", ttok)
+                check("tool token relays in-scope", b" 200" in resp.split(b"\r\n", 1)[0])
+                c.close()
+                c, resp = _creq19("example.com:443", ttok)
+                check("tool token denied out-of-scope", b" 403" in resp.split(b"\r\n", 1)[0])
+                c.close()
+                c, resp = _creq19(f"127.0.0.1:{echo19_port}", sess_tok)
+                check("session token unaffected", b" 200" in resp.split(b"\r\n", 1)[0])
+                c.close()
+                px19.shutdown()
+        finally:
+            stop19.set()
+            echo19.close()
+
+        # P19d: daemon mints scoped token into tool env (printenv probe)
+        try:
+            px19d = start_proxy([], dict(os.environ), "test-daemonscope", [],
+                                allow_domains=["127.0.0.1"], network_profile="minimal")
+            if px19d is None:
+                check("daemon scope proxy starts", False, "proxy is None")
+            else:
+                _dd = dict(dctx2)
+                _dd.update({
+                    "proxy_ref": px19d,
+                    "proxy_host": "127.0.0.1",
+                    "commands": {"printenv": {"network": {"allow_domains": ["127.0.0.1"]}}},
+                    "net_scope": {"allow": ["127.0.0.1", "example.com"], "deny": [],
+                                  "rules": [], "services": list(px19d.server.soteria_routes.keys())},
+                })
+                r19d = daemon_handle_request({"tool": "printenv", "argv": ["SOTERIA_PROXY_TOKEN"],
+                                              "cwd": str(proj), "caller": "session", "depth": 0}, _dd, {})
+                try:
+                    tok19 = _b64t.b64decode(r19d.get("stdout_b64", "")).decode().strip()
+                except Exception:
+                    tok19 = ""
+                check("daemon mints distinct tool token",
+                      r19d.get("exit") == 0 and len(tok19) == 64 and tok19 != px19d.child_env["SOTERIA_PROXY_TOKEN"]
+                      and tok19 in (px19d.server.soteria_tool_tokens or {}),
+                      f"exit={r19d.get('exit')} toklen={len(tok19)}")
+                px19d.shutdown()
+        except Exception as e:
+            check("daemon mints distinct tool token", False, str(e)[:200])
         # setup refreshes stale shipped presets (with backup), leaves custom files
         try:
             _cfg19 = Path(tmp) / "cfg19"
