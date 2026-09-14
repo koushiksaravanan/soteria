@@ -4285,6 +4285,78 @@ def cmd_test(args) -> int:
               p.returncode == 0 and ".bak-" not in p.stdout,
               p.stdout.strip()[-200:])
 
+        # P20: packs — init/verify roundtrip, tamper fails, pull installs, refusals hold
+        try:
+            _pkdir = Path(tmp) / "packsrc"
+            _pkdir.mkdir(parents=True, exist_ok=True)
+            (_pkdir / "team-dev.json").write_text(json.dumps({
+                "meta": {"name": "team-dev"}, "extends": "developer",
+                "network": {"network_profile": "developer"}}))
+            _pkfile = Path(tmp) / "team-1.0.0.zip"
+            p = _run_cli(home, "pack", "init", "--dir", str(_pkdir),
+                         "--name", "team", "--out", str(_pkfile))
+            check("pack init builds", p.returncode == 0 and _pkfile.is_file(),
+                  (p.stdout + p.stderr).strip()[-200:])
+            p = _run_cli(home, "pack", "verify", "--file", str(_pkfile))
+            check("pack verify roundtrip",
+                  p.returncode == 0 and "VALID team" in p.stdout,
+                  (p.stdout + p.stderr).strip()[-200:])
+            # tamper: flip a payload byte without touching the manifest
+            import zipfile as _zf20
+            _raw = _pkfile.read_bytes()
+            _buf = __import__("io").BytesIO(_raw)
+            _files20 = {}
+            with _zf20.ZipFile(_buf) as _zr:
+                for _n in _zr.namelist():
+                    _files20[_n] = _zr.read(_n)
+            _files20["team-dev.json"] = _files20["team-dev.json"].replace(b"developer", b"developex", 1)
+            _tamp = Path(tmp) / "team-tampered.zip"
+            with _zf20.ZipFile(_tamp, "w", _zf20.ZIP_DEFLATED) as _zw:
+                for _n, _b in _files20.items():
+                    _zw.writestr(_n, _b)
+            p = _run_cli(home, "pack", "verify", "--file", str(_tamp))
+            check("pack verify catches tamper",
+                  p.returncode != 0 and "mismatch" in (p.stdout + p.stderr).lower(),
+                  (p.stdout + p.stderr).strip()[-200:])
+            # pull installs + receipts; strict refuses unsigned; shipped names refused
+            _cfg20 = Path(tmp) / "cfg20"
+            p = _run_cli(home, "pack", "pull", "--source", str(_pkfile),
+                         env_extra={"SOTERIA_CONFIG": str(_cfg20)})
+            check("pack pull installs",
+                  p.returncode == 0
+                  and (_cfg20 / "profiles" / "team-dev.json").is_file()
+                  and (_cfg20 / "packs" / "team.json").is_file(),
+                  (p.stdout + p.stderr).strip()[-200:])
+            p = _run_cli(home, "pack", "pull", "--source", str(_pkfile), "--strict",
+                         env_extra={"SOTERIA_CONFIG": str(_cfg20)})
+            check("pack strict refuses unsigned", p.returncode != 0,
+                  (p.stdout + p.stderr).strip()[-200:])
+            p = _run_cli(home, "pack", "list", env_extra={"SOTERIA_CONFIG": str(_cfg20)})
+            check("pack list shows receipt", p.returncode == 0 and "team" in p.stdout,
+                  p.stdout.strip()[-200:])
+            _evildir = Path(tmp) / "evilsrc"
+            _evildir.mkdir(parents=True, exist_ok=True)
+            (_evildir / "developer.json").write_text(json.dumps({"meta": {"name": "developer"}}))
+            _evil = Path(tmp) / "evil-1.0.0.zip"
+            q = _run_cli(home, "pack", "init", "--dir", str(_evildir),
+                         "--name", "evil", "--out", str(_evil))
+            if q.returncode == 0:
+                p = _run_cli(home, "pack", "pull", "--source", str(_evil),
+                             env_extra={"SOTERIA_CONFIG": str(_cfg20)})
+                check("pack pull refuses shipped names", p.returncode != 0,
+                      (p.stdout + p.stderr).strip()[-200:])
+            else:
+                check("pack pull refuses shipped names", False, "evil pack init failed")
+            if shutil.which("cosign"):
+                print("[SKIP] pack sign test — cosign present (would attempt real Fulcio signing)")
+            else:
+                p = _run_cli(home, "pack", "sign", "--file", str(_pkfile))
+                check("pack sign needs cosign",
+                      p.returncode != 0 and "cosign" in (p.stdout + p.stderr).lower(),
+                      (p.stdout + p.stderr).strip()[-200:])
+        except Exception as e:
+            check("pack init builds", False, str(e)[:200])
+
     audit({"kind": "self_test", "level": "INFO",
            "summary": f"{sum(1 for _, ok, _ in results if ok)}/{len(results)} passed"})
     failed = [n for n, ok, _ in results if not ok]
@@ -4363,6 +4435,303 @@ def cmd_profile(args) -> int:
             print(line)
         return 0
     print(f"error: unknown profile action {action!r}", file=sys.stderr)
+    return 2
+
+
+# --- P20: packs (shareable, digest-pinned profile bundles) ---
+PACK_MANIFEST = "pack.json"
+PACK_MAX_FILES = 100
+PACK_MAX_BYTES = 20 * 1024 * 1024
+PACK_MAX_FETCH_BYTES = 10 * 1024 * 1024
+
+
+def _pack_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pack_create_manifest(files: dict[str, bytes], name: str, version: str, description: str = "") -> dict:
+    return {"kind": "soteria-pack", "format": 1, "name": name, "version": version,
+            "description": description or "",
+            "files": {p: _pack_hash(b) for p, b in sorted(files.items())}}
+
+
+def pack_read(data: bytes) -> tuple[dict | None, dict[str, bytes], list[str]]:
+    """Unpack + parse a pack archive. Returns (manifest|None, files, problems).
+
+    Fail-closed guards: file count, total size, manifest shape. Never raises."""
+    import zipfile as _zf
+    import io as _io
+    problems: list[str] = []
+    if len(data) > PACK_MAX_BYTES:
+        return None, {}, [f"pack too large ({len(data)}B > {PACK_MAX_BYTES}B)"]
+    try:
+        zf = _zf.ZipFile(_io.BytesIO(data))
+        names = zf.namelist()
+    except Exception as e:
+        return None, {}, [f"not a zip archive: {type(e).__name__}"]
+    if len(names) > PACK_MAX_FILES:
+        return None, {}, [f"too many files ({len(names)} > {PACK_MAX_FILES})"]
+    files: dict[str, bytes] = {}
+    total = 0
+    try:
+        for n in names:
+            if n.endswith("/") or n != n.strip() or ".." in n.split("/"):
+                problems.append(f"unsafe entry {n!r}")
+                continue
+            try:
+                b = zf.read(n)
+            except Exception:
+                problems.append(f"unreadable entry {n!r}")
+                continue
+            total += len(b)
+            if total > PACK_MAX_BYTES:
+                problems.append("unpacked size exceeds cap")
+                break
+            files[n] = b
+    finally:
+        try:
+            zf.close()
+        except Exception:
+            pass
+    raw = files.get(PACK_MANIFEST)
+    if raw is None:
+        return None, files, problems + [f"missing {PACK_MANIFEST}"]
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, files, problems + [f"{PACK_MANIFEST} is not JSON"]
+    if not isinstance(manifest, dict):
+        return None, files, problems + [f"{PACK_MANIFEST} must be an object"]
+    return manifest, files, problems
+
+
+def pack_check(manifest: dict, files: dict[str, bytes]) -> list[str]:
+    """Verify manifest shape + digest of every file + no extras. [] = valid."""
+    problems: list[str] = []
+    if manifest.get("kind") != "soteria-pack":
+        problems.append(f"unknown kind {manifest.get('kind')!r} (want soteria-pack)")
+    if manifest.get("format") != 1:
+        problems.append(f"unsupported format {manifest.get('format')!r} (want 1)")
+    for k in ("name", "version"):
+        if not manifest.get(k) or not isinstance(manifest[k], str):
+            problems.append(f"manifest.{k} must be a non-empty string")
+    listed = manifest.get("files", {})
+    if not isinstance(listed, dict) or not listed:
+        problems.append("manifest.files must be a non-empty object")
+        return problems
+    import re as _re
+    for p in listed:
+        if not isinstance(p, str) or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", p):
+            problems.append(f"entry {p!r} must be a top-level *.json profile")
+    for p, digest in listed.items():
+        if p == PACK_MANIFEST:
+            continue
+        if p not in files:
+            problems.append(f"missing payload {p!r}")
+        elif _pack_hash(files[p]) != digest:
+            problems.append(f"digest mismatch for {p!r}")
+    for p in files:
+        if p in (PACK_MANIFEST,) or p.endswith(".sig"):
+            continue
+        if p not in listed:
+            problems.append(f"unlisted file {p!r} (packs must declare everything)")
+    return problems
+
+
+def pack_fetch(source: str) -> bytes:
+    """Fetch pack bytes from a path or https URL. Caps size. Raises on failure."""
+    if "://" not in source:
+        return Path(source).read_bytes()
+    from urllib.parse import urlsplit as _us
+    from urllib.request import urlopen as _uo
+    scheme = _us(source).scheme.lower()
+    if scheme not in ("https",):
+        raise ValueError(f"refusing non-https pack source {source!r}")
+    with _uo(source, timeout=30) as r:
+        data = r.read(PACK_MAX_FETCH_BYTES + 1)
+    if len(data) > PACK_MAX_FETCH_BYTES:
+        raise ValueError(f"pack download exceeds {PACK_MAX_FETCH_BYTES}B cap")
+    return data
+
+
+def cmd_pack(args) -> int:
+    action = getattr(args, "pack_action", "list")
+    if action == "init":
+        src = Path(getattr(args, "dir", None) or ".")
+        name = getattr(args, "name", None)
+        if not name:
+            print("error: pack init needs --name", file=sys.stderr)
+            return 2
+        if not src.is_dir():
+            print(f"error: pack dir missing: {src}", file=sys.stderr)
+            return 2
+        files: dict[str, bytes] = {}
+        for f in sorted(src.iterdir()):
+            if f.is_file() and f.suffix == ".json" and f.name != PACK_MANIFEST:
+                try:
+                    files[f.name] = f.read_bytes()
+                except OSError as e:
+                    print(f"error: cannot read {f}: {e}", file=sys.stderr)
+                    return 2
+        if not files:
+            print(f"error: no *.json profiles in {src}", file=sys.stderr)
+            return 2
+        version = "1.0.0"
+        manifest = pack_create_manifest(files, name, version)
+        out = Path(getattr(args, "out", None) or f"{name}-{version}.zip")
+        import zipfile as _zf
+        try:
+            with _zf.ZipFile(out, "w", _zf.ZIP_DEFLATED) as zf:
+                zf.writestr(PACK_MANIFEST, json.dumps(manifest, indent=2))
+                for p, b in files.items():
+                    zf.writestr(p, b)
+        except OSError as e:
+            print(f"error: cannot write {out}: {e}", file=sys.stderr)
+            return 2
+        print(f"packed {len(files)} profiles -> {out} (verify with: ./soteria pack verify --file {out})")
+        audit({"kind": "pack.init", "level": "INFO",
+               "summary": f"pack {name} v{version} ({len(files)} files) -> {out}"})
+        return 0
+    if action == "verify":
+        target = getattr(args, "file", None)
+        if not target:
+            print("error: pack verify needs --file PATH", file=sys.stderr)
+            return 2
+        try:
+            data = Path(str(target)).read_bytes()
+        except OSError as e:
+            print(f"error: cannot read {target}: {e}", file=sys.stderr)
+            return 2
+        manifest, files, problems = pack_read(data)
+        if manifest is not None:
+            problems = pack_check(manifest, files) + problems
+        signed = any(p.endswith(".sig") for p in files)
+        if problems:
+            print(f"INVALID {target}:")
+            for pr in problems:
+                print(f"  - {pr}")
+            audit({"kind": "pack.verify", "level": "DENY",
+                   "summary": f"{target} invalid ({len(problems)} problems)"})
+            return 1
+        print(f"VALID {manifest['name']} v{manifest['version']} "
+              f"({len(manifest['files'])} files, {'signed' if signed else 'unsigned'})")
+        audit({"kind": "pack.verify", "level": "INFO",
+               "summary": f"{target} valid ({manifest['name']} v{manifest['version']}, {'signed' if signed else 'unsigned'})"})
+        return 0
+    if action == "sign":
+        target = getattr(args, "file", None)
+        if not target:
+            print("error: pack sign needs --file PATH", file=sys.stderr)
+            return 2
+        if not shutil.which("cosign"):
+            print("error: cosign not found (install sigstore/cosign; signing needs its Fulcio OIDC flow)",
+                  file=sys.stderr)
+            return 2
+        sig = str(target) + ".sig"
+        try:
+            pr = subprocess.run(["cosign", "sign-blob", "--yes", "--output-signature", sig, str(target)],
+                                capture_output=True, text=True, timeout=120)
+        except OSError as e:
+            print(f"error: cosign failed to start: {e}", file=sys.stderr)
+            return 2
+        if pr.returncode != 0:
+            print(f"error: cosign sign-blob failed: {(pr.stderr or '').strip()[-300:]}", file=sys.stderr)
+            return 1
+        print(f"signed {target} -> {sig} (bundle with the pack; verify checks digests, signature presence is reported)")
+        audit({"kind": "pack.sign", "level": "INFO", "summary": f"signed {target}"})
+        return 0
+    if action == "pull":
+        source = getattr(args, "source", None)
+        if not source:
+            print("error: pack pull needs --source PATH-or-https-URL", file=sys.stderr)
+            return 2
+        strict = bool(getattr(args, "strict", False))
+        force = bool(getattr(args, "force", False))
+        try:
+            data = pack_fetch(str(source))
+        except Exception as e:
+            print(f"error: fetch failed: {e}", file=sys.stderr)
+            return 2
+        manifest, files, problems = pack_read(data)
+        if manifest is not None:
+            problems = pack_check(manifest, files) + problems
+        signed = any(p.endswith(".sig") for p in files)
+        if problems:
+            print(f"error: pack invalid, refusing install:")
+            for pr in problems:
+                print(f"  - {pr}", file=sys.stderr)
+            audit({"kind": "pack.pull", "level": "DENY",
+                   "summary": f"{source} invalid, refused ({len(problems)} problems)"})
+            return 1
+        if strict and not signed:
+            print(f"error: pack unsigned and --strict given, refusing install", file=sys.stderr)
+            audit({"kind": "pack.pull", "level": "DENY",
+                   "summary": f"{source} unsigned, strict refusal"})
+            return 1
+        if not signed:
+            print(f"soteria: pack {manifest['name']} is UNSIGNED — digests match, authorship unverified",
+                  file=sys.stderr)
+        user_dir = _config_dir() / "profiles"
+        packs_dir = _config_dir() / "packs"
+        installed: list[str] = []
+        for p, digest in manifest["files"].items():
+            if p == PACK_MANIFEST:
+                continue
+            dest = user_dir / p
+            if Path(p).stem in PROFILE_PRESETS and not force:
+                print(f"error: pack wants shipped preset {p!r} — refusing (re-run with --force to override)",
+                      file=sys.stderr)
+                audit({"kind": "pack.pull", "level": "DENY",
+                       "summary": f"{source} wanted shipped preset {p}, refused"})
+                return 1
+            try:
+                payload = json.loads(files[p].decode("utf-8"))
+            except Exception:
+                print(f"error: payload {p!r} is not JSON, refusing install", file=sys.stderr)
+                return 1
+            errs = validate_profile(payload)
+            if errs:
+                print(f"error: payload {p!r} invalid profile, refusing install:", file=sys.stderr)
+                for e in errs:
+                    print(f"  - {e}", file=sys.stderr)
+                return 1
+            try:
+                user_dir.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(files[p])
+                installed.append(p)
+            except OSError as e:
+                print(f"error: cannot install {p}: {e}", file=sys.stderr)
+                return 2
+        try:
+            packs_dir.mkdir(parents=True, exist_ok=True)
+            (packs_dir / f"{manifest['name']}.json").write_text(json.dumps(
+                {"name": manifest["name"], "version": manifest["version"], "source": str(source),
+                 "verified_at": ts(), "strict": strict, "signed": signed,
+                 "files": manifest["files"]}, indent=2))
+        except OSError as e:
+            print(f"warn: receipt not written: {e}", file=sys.stderr)
+        print(f"installed {len(installed)} profiles from pack {manifest['name']} v{manifest['version']}"
+              + (" (strict, signed)" if strict else ""))
+        audit({"kind": "pack.pull", "level": "INFO",
+               "summary": f"{source} -> {len(installed)} profiles ({manifest['name']} v{manifest['version']})"})
+        return 0
+    if action == "list":
+        packs_dir = _config_dir() / "packs"
+        try:
+            receipts = sorted(packs_dir.glob("*.json")) if packs_dir.is_dir() else []
+        except OSError:
+            receipts = []
+        if not receipts:
+            print("(no packs installed)")
+            return 0
+        for r in receipts:
+            try:
+                m = json.loads(r.read_text())
+                print(f"{m.get('name')} v{m.get('version')}  signed={m.get('signed')}  <- {m.get('source')}")
+            except Exception:
+                continue
+        return 0
+    print(f"error: unknown pack action {action!r}", file=sys.stderr)
     return 2
 
 
@@ -4599,6 +4968,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--a", default="minimal")
     p.add_argument("--b", default="developer")
     p.set_defaults(fn=cmd_profile)
+    pk = sub.add_parser("pack", help="init/verify/sign/pull/list profile packs")
+    pk.add_argument("pack_action", nargs="?", default="list", choices=["list", "init", "verify", "sign", "pull"])
+    pk.add_argument("--name", default=None)
+    pk.add_argument("--dir", default=None)
+    pk.add_argument("--file", default=None)
+    pk.add_argument("--out", default=None)
+    pk.add_argument("--source", default=None)
+    pk.add_argument("--strict", action="store_true", help="refuse unsigned packs on pull")
+    pk.add_argument("--force", action="store_true", help="allow overwriting shipped preset names on pull")
+    pk.set_defaults(fn=cmd_pack)
     su = sub.add_parser("setup", help="check host + init config dirs")
     su.add_argument("--check-only", action="store_true")
     su.set_defaults(fn=cmd_setup)
