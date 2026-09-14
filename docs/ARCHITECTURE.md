@@ -121,6 +121,7 @@ Verdicts: `allow`, `deny (argv|tool|l7|chain)`, `ask (terminal/socket approve/de
 
 ### 4.6 Policy engine
 * JSON profiles + `extends` + `groups` (`node_runtime`, `python_runtime`, `rust_runtime`) — **shipped** (`profiles/`, `profile init/validate/show/diff`).
+* Packs: digest-pinned profile bundles (`pack init/verify/pull/list`, cosign `sign` passthrough) — **shipped**. Unsigned packs install with a warning, `--strict` refuses; shipped preset names need `--force`.
 * Fields: `filesystem.allow/read/write/deny/bypass_protection` (+ `allow_files`), `network.network_profile/allow_domain/deny_domain/custom_credentials`, `command_policies.commands` with `from`/`can_use`/`invocation_policy`/`sandbox.fs_read/fs_write` — **shipped** (launch gate + supervised shims).
 * Runtime rules: CEL-compatible planned, not built. At-rest `scan` shipped (see 4.7); live hooks still pending (Phase 2).
 * `env allow/deny/set` filtering with wildcards — **shipped**.
